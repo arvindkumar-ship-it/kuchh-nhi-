@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <utility>
 #include "common.h"
 #include "pager.h"
 #include "btree_node.h"
@@ -23,6 +24,12 @@ public:
 
     // mil gayi toh true aur value out me
     bool get(int64_t key, std::string* out);
+
+    // key hata do. true agar thi
+    bool remove(int64_t key);
+
+    // saari (key, value) leaf chain se, sorted
+    std::vector<std::pair<int64_t, std::string>> scan();
 
     // saari keys leaf chain se, sorted order me
     std::vector<int64_t> all_keys();

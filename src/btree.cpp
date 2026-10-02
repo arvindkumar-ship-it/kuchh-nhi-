@@ -147,6 +147,49 @@ bool BTree::get(int64_t key, std::string* out) {
     return false;
 }
 
+bool BTree::remove(int64_t key) {
+    PageId pid = root_;
+    while (true) {
+        char buf[PAGE_SIZE];
+        pager_.read_page(pid, buf);
+        BTreeNode n(buf);
+        if (!n.is_leaf()) {
+            pid = n.child_at(n.find_child_index(key));
+            continue;
+        }
+        bool found;
+        uint16_t i = n.lower_bound(key, &found);
+        if (!found) return false;
+        n.leaf_remove(i);
+        pager_.write_page(pid, buf);
+        return true;
+    }
+}
+
+std::vector<std::pair<int64_t, std::string>> BTree::scan() {
+    std::vector<std::pair<int64_t, std::string>> out;
+    PageId pid = root_;
+    while (pid != INVALID_PAGE) {
+        char buf[PAGE_SIZE];
+        pager_.read_page(pid, buf);
+        BTreeNode n(buf);
+        if (n.is_leaf()) break;
+        pid = n.child_at(0);
+    }
+    while (pid != INVALID_PAGE) {
+        char buf[PAGE_SIZE];
+        pager_.read_page(pid, buf);
+        BTreeNode n(buf);
+        for (uint16_t i = 0; i < n.count(); i++) {
+            uint16_t len;
+            const char* v = n.leaf_value(i, &len);
+            out.emplace_back(n.key_at(i), std::string(v, len));
+        }
+        pid = n.right_ptr();
+    }
+    return out;
+}
+
 std::vector<int64_t> BTree::all_keys() {
     std::vector<int64_t> keys;
 

@@ -88,9 +88,12 @@ std::string Database::execute(const std::string& sql) {
     switch (s.kind) {
         case StmtKind::Create: return do_create(s);
         case StmtKind::Insert: return do_insert(s);
-        default:
-            throw std::runtime_error("abhi sirf CREATE TABLE aur INSERT chalte hain");
+        case StmtKind::Select: return do_select(s);
+        case StmtKind::Update: return do_update(s);
+        case StmtKind::Delete: return do_delete(s);
+        default: break;
     }
+    throw std::runtime_error("statement samajh nahi aaya");
 }
 
 std::string Database::do_create(const Stmt& s) {

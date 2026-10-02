@@ -38,6 +38,9 @@ public:
     // key sorted jagah pe daalo
     InsertResult leaf_insert(int64_t key, const char* val, uint16_t vlen);
 
+    // i-th cell hata do
+    void leaf_remove(uint16_t i) { sp_.remove_at(i); }
+
     // i-th cell ki value
     const char* leaf_value(uint16_t i, uint16_t* vlen) const;
 

@@ -39,6 +39,9 @@ private:
 
     std::string do_create(const Stmt& s);
     std::string do_insert(const Stmt& s);
+    std::string do_select(const Stmt& s);
+    std::string do_update(const Stmt& s);
+    std::string do_delete(const Stmt& s);
 };
 
 }  // namespace mkdb
