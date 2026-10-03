@@ -26,6 +26,18 @@ public:
     uint16_t count() const { return sp_.num_slots(); }
     uint16_t free_space() const { return sp_.free_space(); }
 
+    // sirf zinda cells ka size (holes nahi): har cell ki lambai + 4 (length field + slot).
+    // free_space() me delete ke holes shamil nahi hote, isliye merge ka faisla isse
+    uint32_t live_bytes() const {
+        uint32_t total = 0;
+        for (uint16_t i = 0; i < count(); i++) {
+            uint16_t len;
+            sp_.get(i, &len);
+            total += len + 4;
+        }
+        return total;
+    }
+
     // i-th cell ki key
     int64_t key_at(uint16_t i) const;
 
@@ -60,6 +72,9 @@ public:
     void set_child_at(uint16_t i, PageId p);
 
     InsertResult internal_insert(uint16_t idx, int64_t key, PageId child);
+
+    // i-th cell (key + child) hata do
+    void internal_remove(uint16_t i) { sp_.remove_at(i); }
 
     // ---------- split ----------
 

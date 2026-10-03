@@ -36,7 +36,7 @@ struct Assignment {
     ExprPtr value;
 };
 
-enum class StmtKind { Create, Insert, Select, Delete, Update };
+enum class StmtKind { Create, Insert, Select, Delete, Update, CreateIndex };
 
 // ek struct sab statements ke liye, kind se pata chalta hai kaun si fields kaam ki hain
 struct Stmt {
@@ -45,6 +45,11 @@ struct Stmt {
 
     // CREATE
     std::vector<ColumnDef> columns;
+
+    // CREATE INDEX (table naam s.table me)
+    std::string index_name;
+    std::string index_col;
+    bool index_unique = false;
 
     // INSERT
     std::vector<std::string> insert_cols;  // khali = saare columns order me

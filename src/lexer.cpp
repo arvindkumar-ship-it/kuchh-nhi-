@@ -18,13 +18,17 @@ static const std::unordered_map<std::string, Tok>& keywords() {
         {"INT", Tok::Int},       {"TEXT", Tok::Text},
         {"ORDER", Tok::Order},   {"BY", Tok::By},
         {"LIMIT", Tok::Limit},   {"ASC", Tok::Asc},
-        {"DESC", Tok::Desc},
+        {"DESC", Tok::Desc},     {"UNIQUE", Tok::Unique},
+        {"INDEX", Tok::Index},   {"ON", Tok::On},
     };
     return m;
 }
 
 const char* tok_name(Tok t) {
     switch (t) {
+        case Tok::Unique: return "UNIQUE";
+        case Tok::Index: return "INDEX";
+        case Tok::On: return "ON";
         case Tok::Create: return "CREATE";
         case Tok::Table: return "TABLE";
         case Tok::Insert: return "INSERT";

@@ -1,67 +1,10 @@
 #include "database.h"
-#include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
+#include "executor.h"
 
 namespace mkdb {
-
-static Value truth(bool b) { return Value::Int(b ? 1 : 0); }
-
-// expression ko ek row pe chalao
-static Value eval(const Expr& e, const TableSchema& sc, const std::vector<Value>& row) {
-    switch (e.kind) {
-        case ExprKind::Number: return Value::Int(e.num);
-        case ExprKind::String: return Value::Text(e.text);
-        case ExprKind::Column: {
-            int c = sc.find_column(e.text);
-            if (c < 0) throw std::runtime_error("column nahi mila: " + e.text);
-            return row[c];
-        }
-        case ExprKind::Unary: {
-            Value v = eval(*e.lhs, sc, row);
-            if (v.type != ColType::Int) throw std::runtime_error("number chahiye");
-            if (e.op == Tok::Minus) return Value::Int(-v.i);
-            return truth(v.i == 0);  // NOT
-        }
-        case ExprKind::Binary: {
-            Value a = eval(*e.lhs, sc, row), b = eval(*e.rhs, sc, row);
-            if (e.op == Tok::And || e.op == Tok::Or) {
-                if (a.type != ColType::Int || b.type != ColType::Int)
-                    throw std::runtime_error("AND/OR me number chahiye");
-                return truth(e.op == Tok::And ? (a.i && b.i) : (a.i || b.i));
-            }
-            if (a.type != b.type) throw std::runtime_error("number aur text ka mel nahi");
-            bool txt = a.type == ColType::Text;
-            int cmp = txt ? a.s.compare(b.s) : (a.i < b.i ? -1 : a.i > b.i ? 1 : 0);
-            switch (e.op) {
-                case Tok::Eq:  return truth(cmp == 0);
-                case Tok::Neq: return truth(cmp != 0);
-                case Tok::Lt:  return truth(cmp < 0);
-                case Tok::Le:  return truth(cmp <= 0);
-                case Tok::Gt:  return truth(cmp > 0);
-                case Tok::Ge:  return truth(cmp >= 0);
-                default: break;
-            }
-            if (txt) throw std::runtime_error("text pe arithmetic nahi chalta");
-            switch (e.op) {
-                case Tok::Plus:  return Value::Int(a.i + b.i);
-                case Tok::Minus: return Value::Int(a.i - b.i);
-                case Tok::Star:  return Value::Int(a.i * b.i);
-                case Tok::Slash:
-                    if (b.i == 0) throw std::runtime_error("zero se divide");
-                    return Value::Int(a.i / b.i);
-                default: break;
-            }
-        }
-    }
-    throw std::runtime_error("expression samajh nahi aaya");
-}
-
-static bool matches(const Stmt& s, const TableSchema& sc, const std::vector<Value>& row) {
-    if (!s.where) return true;
-    Value v = eval(*s.where, sc, row);
-    if (v.type != ColType::Int) throw std::runtime_error("WHERE me condition chahiye");
-    return v.i != 0;
-}
 
 static std::string show(const Value& v) {
     return v.type == ColType::Int ? std::to_string(v.i) : v.s;
@@ -73,43 +16,28 @@ std::string Database::do_select(const Stmt& s) {
     const TableSchema& sc = t->schema;
 
     std::vector<size_t> cols;
-    if (s.select_all) {
-        for (size_t i = 0; i < sc.columns.size(); i++) cols.push_back(i);
-    } else {
-        for (const std::string& n : s.select_cols) {
-            int c = sc.find_column(n);
-            if (c < 0) throw std::runtime_error("column nahi mila: " + n);
-            cols.push_back((size_t)c);
-        }
-    }
-    int oc = -1;
-    if (!s.order_col.empty()) {
-        oc = sc.find_column(s.order_col);
-        if (oc < 0) throw std::runtime_error("column nahi mila: " + s.order_col);
-    }
-
-    BTree tree(pager_, t->root);
-    std::vector<std::vector<Value>> rows;
-    for (auto& kv : tree.scan()) {
-        std::vector<Value> r = decode_row(sc, kv.first, kv.second.data(), kv.second.size());
-        if (matches(s, sc, r)) rows.push_back(std::move(r));
-    }
-    if (oc >= 0) {
-        std::stable_sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) {
-            bool lt = a[oc].type == ColType::Int ? a[oc].i < b[oc].i : a[oc].s < b[oc].s;
-            bool gt = a[oc].type == ColType::Int ? a[oc].i > b[oc].i : a[oc].s > b[oc].s;
-            return s.order_desc ? gt : lt;
-        });
-    }
-    if (s.has_limit && (int64_t)rows.size() > s.limit) rows.resize((size_t)std::max<int64_t>(s.limit, 0));
+    IterPtr plan = build_select_plan(pager_, t->root, sc, s, &cols, defs_for(s.table), sort_mem_);
 
     std::string out;
     for (size_t i = 0; i < cols.size(); i++) out += (i ? " | " : "") + sc.columns[cols[i]].name;
-    for (auto& r : rows) {
+    size_t n = 0;
+    Row r;
+    while (plan->next(&r)) {  // row-by-row pull
         out += "\n";
-        for (size_t i = 0; i < cols.size(); i++) out += (i ? " | " : "") + show(r[cols[i]]);
+        for (size_t i = 0; i < r.size(); i++) out += (i ? " | " : "") + show(r[i]);
+        n++;
     }
-    return out + "\n(" + std::to_string(rows.size()) + " rows)";
+    return out + "\n(" + std::to_string(n) + " rows)";
+}
+
+std::string Database::do_explain(const Stmt& s) {
+    Table* t = find_table(s.table);
+    if (!t) throw std::runtime_error("table nahi mili: " + s.table);
+    std::vector<size_t> cols;
+    IterPtr plan = build_select_plan(pager_, t->root, t->schema, s, &cols, defs_for(s.table), sort_mem_);
+    std::string d = plan->describe();
+    if (!d.empty() && d.back() == '\n') d.pop_back();
+    return d;
 }
 
 std::string Database::do_delete(const Stmt& s) {
@@ -118,12 +46,20 @@ std::string Database::do_delete(const Stmt& s) {
     BTree tree(pager_, t->root);
 
     // pehle poora scan + check, phir hatao (scan ke beech tree nahi badalte)
-    std::vector<int64_t> dead;
-    for (auto& kv : tree.scan()) {
-        auto r = decode_row(t->schema, kv.first, kv.second.data(), kv.second.size());
-        if (matches(s, t->schema, r)) dead.push_back(kv.first);
+    std::vector<std::pair<int64_t, Row>> dead;
+    {
+        BTree::Cursor cur(tree);
+        int64_t k;
+        std::string v;
+        while (cur.next(&k, &v)) {
+            Row r = decode_row(t->schema, k, v.data(), v.size());
+            if (row_matches(s.where.get(), t->schema, r)) dead.emplace_back(k, std::move(r));
+        }
     }
-    for (int64_t k : dead) tree.remove(k);
+    for (auto& dr : dead) {
+        tree.remove(dr.first);
+        idx_remove_row(s.table, dr.second, dr.first);
+    }
     pager_.flush();
     return std::to_string(dead.size()) + " row hati";
 }
@@ -142,23 +78,62 @@ std::string Database::do_update(const Stmt& s) {
     }
 
     BTree tree(pager_, t->root);
-    // sab naye payload pehle bana lo, taaki beech me error aaye toh kuch na badle
-    std::vector<std::pair<int64_t, std::string>> upd;
-    for (auto& kv : tree.scan()) {
-        auto r = decode_row(sc, kv.first, kv.second.data(), kv.second.size());
-        if (!matches(s, sc, r)) continue;
-        std::vector<Value> nr = r;
-        for (size_t i = 0; i < acol.size(); i++) {
-            Value v = eval(*s.assigns[i].value, sc, r);  // purani row pe
-            if (v.type != sc.columns[acol[i]].type)
-                throw std::runtime_error("column '" + sc.columns[acol[i]].name + "' ke liye galat type");
-            nr[acol[i]] = v;
+    // sab naye rows pehle bana lo, taaki beech me error aaye toh kuch na badle
+    struct Upd {
+        int64_t key;
+        Row old_row, new_row;
+        std::string payload;
+    };
+    std::vector<Upd> upd;
+    {
+        BTree::Cursor cur(tree);
+        int64_t k;
+        std::string v;
+        while (cur.next(&k, &v)) {
+            Row r = decode_row(sc, k, v.data(), v.size());
+            if (!row_matches(s.where.get(), sc, r)) continue;
+            Row nr = r;
+            for (size_t i = 0; i < acol.size(); i++) {
+                Value nv = eval_expr(*s.assigns[i].value, sc, r);  // purani row pe
+                if (nv.type != sc.columns[acol[i]].type)
+                    throw std::runtime_error("column '" + sc.columns[acol[i]].name + "' ke liye galat type");
+                nr[acol[i]] = nv;
+            }
+            std::string payload = encode_row(sc, nr);
+            upd.push_back(Upd{k, std::move(r), std::move(nr), std::move(payload)});
         }
-        upd.emplace_back(kv.first, encode_row(sc, nr));
     }
-    for (auto& u : upd) {
-        tree.remove(u.first);
-        tree.insert(u.first, u.second);
+
+    // UNIQUE index: badlav ke BAAD ki final state valid honi chahiye
+    std::unordered_map<int64_t, size_t> pos;
+    for (size_t i = 0; i < upd.size(); i++) pos[upd[i].key] = i;
+    for (const Index& ix : indexes_) {
+        if (ix.table != s.table || !ix.unique) continue;
+        std::unordered_set<std::string> seen;
+        for (const Upd& u : upd) {
+            const Value& ov = u.old_row[ix.col];
+            const Value& nv = u.new_row[ix.col];
+            if (value_equal(ov, nv)) continue;
+            std::string vk = nv.type == ColType::Int ? "i" + std::to_string(nv.i) : "s" + nv.s;
+            if (!seen.insert(vk).second) throw std::runtime_error("UNIQUE index '" + ix.name + "': ye value pehle se hai");
+            for (int64_t p : index_lookup(pager_, ix.root, nv)) {
+                auto it = pos.find(p);
+                bool moving = it != pos.end() &&
+                              !value_equal(upd[it->second].old_row[ix.col], upd[it->second].new_row[ix.col]);
+                if (!moving) throw std::runtime_error("UNIQUE index '" + ix.name + "': ye value pehle se hai");
+            }
+        }
+    }
+
+    for (const Upd& u : upd) {
+        tree.remove(u.key);
+        tree.insert(u.key, u.payload);
+        for (const Index& ix : indexes_) {
+            if (ix.table != s.table) continue;
+            if (value_equal(u.old_row[ix.col], u.new_row[ix.col])) continue;
+            index_remove(pager_, ix.root, u.old_row[ix.col], u.key);
+            index_add(pager_, ix.root, u.new_row[ix.col], u.key);
+        }
     }
     pager_.flush();
     return std::to_string(upd.size()) + " row badli";

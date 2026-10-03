@@ -1,4 +1,7 @@
 #include "database.h"
+#include "executor.h"
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <stdexcept>
 
@@ -26,6 +29,7 @@ static Value eval_const(const Expr& e) {
 }
 
 Database::Database(const std::string& path) : pager_(path) {
+    pager_.enable_freelist();  // page 0 header hamara hai, freelist head uske bytes 16..19 me
     if (pager_.page_count() == 0) {
         pager_.allocate_page();  // page 0 = header
         catalog_root_ = BTree::create(pager_);
@@ -34,6 +38,10 @@ Database::Database(const std::string& path) : pager_(path) {
         return;
     }
 
+    load_header();
+}
+
+void Database::load_header() {
     char buf[PAGE_SIZE];
     pager_.read_page(0, buf);
 
@@ -48,11 +56,35 @@ Database::Database(const std::string& path) : pager_(path) {
 
 void Database::save_header() {
     char buf[PAGE_SIZE] = {0};
+    if (pager_.page_count() > 0) pager_.read_page(0, buf);  // freelist head (bytes 16..19) na mitao
     uint32_t magic = MAGIC;
     std::memcpy(buf, &magic, 4);
     std::memcpy(buf + 4, &catalog_root_, 4);
     std::memcpy(buf + 8, &next_id_, 8);
     pager_.write_page(0, buf);
+}
+
+void Database::reload_state() {
+    tables_.clear();
+    indexes_.clear();
+    load_header();
+}
+
+// index catalog entry: root(4) | unique(1) | len+name | len+table | len+col   (key = -id)
+static void put_s(std::string& o, const std::string& s) {
+    uint16_t n = (uint16_t)s.size();
+    o.append((const char*)&n, 2);
+    o += s;
+}
+static std::string get_s(const std::string& v, size_t* p) {
+    uint16_t n;
+    if (*p + 2 > v.size()) throw std::runtime_error("catalog kharab hai");
+    std::memcpy(&n, v.data() + *p, 2);
+    *p += 2;
+    if (*p + n > v.size()) throw std::runtime_error("catalog kharab hai");
+    std::string s = v.substr(*p, n);
+    *p += n;
+    return s;
 }
 
 void Database::load_catalog() {
@@ -62,11 +94,30 @@ void Database::load_catalog() {
         cat.get(id, &v);
         if (v.size() < 4) throw std::runtime_error("catalog kharab hai");
 
+        if (id < 0) {  // secondary index
+            Index ix;
+            ix.id = -id;
+            std::memcpy(&ix.root, v.data(), 4);
+            ix.unique = v.size() > 4 && v[4] != 0;
+            size_t p = 5;
+            ix.name = get_s(v, &p);
+            ix.table = get_s(v, &p);
+            ix.col_name = get_s(v, &p);
+            indexes_.push_back(ix);
+            continue;
+        }
+
         Table t;
         t.id = id;
         std::memcpy(&t.root, v.data(), 4);
         t.schema = decode_schema(v.data() + 4, v.size() - 4);
         tables_.push_back(t);
+    }
+    for (Index& ix : indexes_) {  // column index ab resolve (tables load ho chuki)
+        Table* t = find_table(ix.table);
+        if (!t) throw std::runtime_error("catalog kharab: index ki table nahi mili");
+        ix.col = t->schema.find_column(ix.col_name);
+        if (ix.col < 0) throw std::runtime_error("catalog kharab: index ka column nahi mila");
     }
 }
 
@@ -83,10 +134,51 @@ std::vector<std::string> Database::table_names() const {
     return names;
 }
 
+static std::string norm(const std::string& sql) {
+    size_t b = 0, e = sql.size();
+    while (b < e && std::isspace((unsigned char)sql[b])) b++;
+    while (e > b && (std::isspace((unsigned char)sql[e - 1]) || sql[e - 1] == ';')) e--;
+    std::string s = sql.substr(b, e - b);
+    for (char& ch : s) ch = (char)std::toupper((unsigned char)ch);
+    return s;
+}
+
 std::string Database::execute(const std::string& sql) {
+    std::string up = norm(sql);
+    if (up == "BEGIN") {
+        pager_.begin();
+        return "transaction shuru";
+    }
+    if (up == "COMMIT") {
+        pager_.commit();
+        return "commit ho gaya";
+    }
+    if (up == "ROLLBACK") {
+        if (pager_.rollback()) reload_state();
+        return "rollback ho gaya";
+    }
+    try {
+        return dispatch(sql);
+    } catch (...) {
+        // transaction ke bahar statement beech me fail hua toh adhura kaam undo
+        if (!pager_.in_txn() && pager_.rollback()) reload_state();
+        throw;
+    }
+}
+
+std::string Database::dispatch(const std::string& sql) {
+    if (norm(sql).rfind("EXPLAIN ", 0) == 0) {
+        size_t p = sql.find_first_not_of(" \t\r\n");
+        Stmt s = parse(sql.substr(p + 8));
+        prepare(s);
+        if (s.kind != StmtKind::Select) throw std::runtime_error("EXPLAIN sirf SELECT pe chalta hai");
+        return do_explain(s);
+    }
     Stmt s = parse(sql);
+    prepare(s);
     switch (s.kind) {
         case StmtKind::Create: return do_create(s);
+        case StmtKind::CreateIndex: return do_create_index(s);
         case StmtKind::Insert: return do_insert(s);
         case StmtKind::Select: return do_select(s);
         case StmtKind::Update: return do_update(s);
@@ -94,6 +186,107 @@ std::string Database::execute(const std::string& sql) {
         default: break;
     }
     throw std::runtime_error("statement samajh nahi aaya");
+}
+
+void Database::prepare(Stmt& s) {
+    if (s.kind == StmtKind::Insert) {
+        for (ExprPtr& e : s.values) fold_constants(e);  // INSERT me 1+2 bhi chalega
+        return;
+    }
+    if (s.kind != StmtKind::Select && s.kind != StmtKind::Update && s.kind != StmtKind::Delete) return;
+    fold_constants(s.where);
+    for (Assignment& a : s.assigns) fold_constants(a.value);
+    Table* t = find_table(s.table);
+    if (!t) return;  // table ka error aage wahi dega
+    const TableSchema& sc = t->schema;
+    if (s.where && check_expr_type(*s.where, sc) != ColType::Int)
+        throw std::runtime_error("WHERE me condition chahiye");
+    for (Assignment& a : s.assigns) {
+        int c = sc.find_column(a.col);
+        if (c < 0) throw std::runtime_error("column nahi mila: " + a.col);
+        if (check_expr_type(*a.value, sc) != sc.columns[c].type)
+            throw std::runtime_error("column '" + a.col + "' ke liye galat type");
+    }
+}
+
+std::vector<IndexDef> Database::defs_for(const std::string& table) const {
+    std::vector<IndexDef> out;
+    for (const Index& ix : indexes_) {
+        if (ix.table != table) continue;
+        IndexDef d;
+        d.name = ix.name;
+        d.col = ix.col;
+        d.unique = ix.unique;
+        d.root = ix.root;
+        out.push_back(d);
+    }
+    return out;
+}
+
+void Database::check_unique(const std::string& table, const std::vector<Value>& row) {
+    for (const Index& ix : indexes_) {
+        if (ix.table != table || !ix.unique) continue;
+        if (!index_lookup(pager_, ix.root, row[ix.col]).empty())
+            throw std::runtime_error("UNIQUE index '" + ix.name + "': ye value pehle se hai");
+    }
+}
+
+void Database::idx_add_row(const std::string& table, const std::vector<Value>& row, int64_t pk) {
+    for (const Index& ix : indexes_)
+        if (ix.table == table) index_add(pager_, ix.root, row[ix.col], pk);
+}
+
+void Database::idx_remove_row(const std::string& table, const std::vector<Value>& row, int64_t pk) {
+    for (const Index& ix : indexes_)
+        if (ix.table == table) index_remove(pager_, ix.root, row[ix.col], pk);
+}
+
+std::string Database::do_create_index(const Stmt& s) {
+    Table* t = find_table(s.table);
+    if (!t) throw std::runtime_error("table nahi mili: " + s.table);
+    int c = t->schema.find_column(s.index_col);
+    if (c < 0) throw std::runtime_error("column nahi mila: " + s.index_col);
+    if (c == t->schema.pk) throw std::runtime_error("primary key pe alag index ki zarurat nahi (wo pehle se index hai)");
+    for (const Index& x : indexes_)
+        if (x.name == s.index_name) throw std::runtime_error("index pehle se hai: " + s.index_name);
+
+    Index ix;
+    ix.name = s.index_name;
+    ix.table = s.table;
+    ix.col_name = s.index_col;
+    ix.col = c;
+    ix.unique = s.index_unique;
+    ix.root = BTree::create(pager_);
+
+    // maujooda rows se index bharo
+    {
+        BTree tree(pager_, t->root);
+        BTree::Cursor cur(tree);
+        int64_t k;
+        std::string v;
+        while (cur.next(&k, &v)) {
+            std::vector<Value> r = decode_row(t->schema, k, v.data(), v.size());
+            if (ix.unique && !index_lookup(pager_, ix.root, r[c]).empty())
+                throw std::runtime_error("UNIQUE index nahi ban sakta: column me duplicate values hain");
+            index_add(pager_, ix.root, r[c], k);
+        }
+    }
+
+    std::string cv(4, '\0');
+    std::memcpy(&cv[0], &ix.root, 4);
+    cv.push_back(ix.unique ? 1 : 0);
+    put_s(cv, ix.name);
+    put_s(cv, ix.table);
+    put_s(cv, ix.col_name);
+
+    ix.id = next_id_;
+    BTree cat(pager_, catalog_root_);
+    cat.insert(-ix.id, cv);
+    next_id_++;
+    save_header();
+    pager_.flush();
+    indexes_.push_back(ix);
+    return std::string("index ban gaya: ") + ix.name;
 }
 
 std::string Database::do_create(const Stmt& s) {
@@ -176,10 +369,12 @@ std::string Database::do_insert(const Stmt& s) {
     int64_t key = row_key(sc, row);
     std::string payload = encode_row(sc, row);
 
+    check_unique(s.table, row);  // koi bhi badlav se pehle
     BTree tree(pager_, t->root);
     if (!tree.insert(key, payload)) {
         throw std::runtime_error("primary key " + std::to_string(key) + " pehle se hai");
     }
+    idx_add_row(s.table, row, key);
     pager_.flush();
     return "1 row daali";
 }

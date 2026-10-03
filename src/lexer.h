@@ -8,7 +8,7 @@ enum class Tok {
     // keywords
     Create, Table, Insert, Into, Values, Select, From, Where,
     Delete, Update, Set, And, Or, Not, Primary, Key, Int, Text,
-    Order, By, Limit, Asc, Desc,
+    Order, By, Limit, Asc, Desc, Unique, Index, On,
     // baaki sab
     Ident, Number, String,
     LParen, RParen, Comma, Semicolon, Star,
