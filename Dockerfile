@@ -11,4 +11,5 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY --from=build /app/mkdb_server .
 COPY playground ./playground
-CMD ["sh", "-c", "./mkdb_server /tmp/demo.db 7878 127.0.0.1 & sleep 1 && python playground/bridge.py 7878"]
+COPY start.sh .
+CMD ["sh", "start.sh"]
