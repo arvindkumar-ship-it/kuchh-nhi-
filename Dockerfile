@@ -12,4 +12,5 @@ WORKDIR /app
 COPY --from=build /app/mkdb_server .
 COPY playground ./playground
 COPY start.sh .
+RUN sed -i 's/\r$//' start.sh
 CMD ["sh", "start.sh"]
