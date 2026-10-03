@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mkdb</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #fff; color: #000;
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  .mono, code, pre, textarea, td, th { font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", monospace; }
+
+  header {
+    display: flex; align-items: baseline; gap: 14px;
+    padding: 14px 20px; border-bottom: 1px solid #000;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 700; letter-spacing: .02em; }
+  header .sub { font-size: 12px; color: #666; }
+  .status { margin-left: auto; font-size: 12px; color: #666; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; border: 1px solid #000; background: #fff; display: inline-block; }
+  .dot.on { background: #000; }
+
+  .wrap { flex: 1; display: flex; min-height: 0; }
+
+  aside { width: 260px; flex-shrink: 0; border-right: 1px solid #000; overflow-y: auto; padding: 16px 20px; }
+  aside h2 { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: #666; margin: 0 0 12px; font-weight: 600; }
+  .tbl { margin-bottom: 18px; }
+  .tbl .name { font-weight: 700; cursor: pointer; display: flex; justify-content: space-between; padding-bottom: 4px; border-bottom: 1px solid #000; }
+  .tbl .name:hover { text-decoration: underline; }
+  .tbl .name span:last-child { font-weight: 400; color: #666; font-size: 12px; }
+  .col { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; border-bottom: 1px solid #e5e5e5; font-size: 13px; }
+  .col .t { color: #666; font-size: 12px; }
+  .col .k { margin-left: auto; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; border: 1px solid #000; padding: 0 5px; white-space: nowrap; }
+  .empty { color: #666; font-size: 13px; }
+
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .editor { padding: 16px 20px; border-bottom: 1px solid #000; }
+  textarea {
+    width: 100%; height: 160px; resize: vertical; padding: 10px 12px;
+    background: #fff; color: #000; border: 1px solid #000; border-radius: 0;
+    font-size: 13.5px; line-height: 1.55; tab-size: 2;
+  }
+  textarea:focus { outline: 2px solid #000; outline-offset: 2px; }
+
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  button {
+    background: #fff; color: #000; border: 1px solid #000; border-radius: 0;
+    padding: 6px 14px; font: inherit; cursor: pointer;
+  }
+  button:hover { background: #000; color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.run { background: #000; color: #fff; font-weight: 600; }
+  button.run:hover { background: #333; }
+  .bar .lbl { color: #666; font-size: 12px; margin-left: 8px; }
+  .bar .hint { color: #666; font-size: 12px; margin-left: auto; }
+
+  #out { flex: 1; overflow-y: auto; padding: 16px 20px 32px; }
+  .card { border: 1px solid #000; margin-bottom: 14px; }
+  .card .q { padding: 8px 12px; border-bottom: 1px solid #000; display: flex; gap: 12px; background: #f6f6f6; }
+  .card .q code { flex: 1; word-break: break-word; font-size: 13px; }
+  .card .q .ms { color: #666; font-size: 12px; white-space: nowrap; }
+  .card .body { padding: 10px 12px; }
+  .card.err { border-width: 2px; }
+  .card.err .q { background: #000; color: #fff; }
+  .card.err .q .ms { color: #bbb; }
+  pre.msg { margin: 0; white-space: pre-wrap; font-size: 13px; line-height: 1.55; }
+  .card.err pre.msg::before { content: "ERROR  "; font-weight: 700; }
+
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; min-width: 100%; }
+  th, td { text-align: left; padding: 6px 14px 6px 0; white-space: nowrap; font-size: 13px; }
+  th { border-bottom: 1px solid #000; font-weight: 700; }
+  td { border-bottom: 1px solid #e5e5e5; }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .foot { color: #666; font-size: 12px; padding-top: 8px; border-top: 1px solid #000; margin-top: 6px; }
+
+  @media (max-width: 760px) {
+    .wrap { flex-direction: column; }
+    aside { width: 100%; max-height: 190px; border-right: none; border-bottom: 1px solid #000; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>mkdb</h1>
+  <span class="sub">database from scratch in C++</span>
+  <span class="status"><span id="dot" class="dot"></span><span id="st">connecting</span></span>
+</header>
+<div class="wrap">
+  <aside>
+    <h2>Tables</h2>
+    <div id="tables"><div class="empty">koi table nahi</div></div>
+  </aside>
+  <main>
+    <div class="editor">
+      <textarea id="sql" spellcheck="false" placeholder="SQL likho, ; se alag karo. Ctrl+Enter se chalao."></textarea>
+      <div class="bar">
+        <button class="run" id="run">Run</button>
+        <button id="clear">Clear</button>
+        <span class="lbl">Examples</span>
+        <button data-ex="basic">Tables + data</button>
+        <button data-ex="index">Index + EXPLAIN</button>
+        <button data-ex="txn">Transaction</button>
+        <button data-ex="err">Error</button>
+        <span class="hint">Ctrl + Enter</span>
+      </div>
+    </div>
+    <div id="out"></div>
+  </main>
+</div>
+
+<script>
+const EXAMPLES = {
+  basic:
+`CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, city TEXT);
+INSERT INTO users VALUES (1, 'Ravi', 21, 'Delhi');
+INSERT INTO users VALUES (2, 'Sita', 30, 'Pune');
+INSERT INTO users VALUES (3, 'Aman', 25, 'Delhi');
+INSERT INTO users VALUES (4, 'Neha', 19, 'Mumbai');
+SELECT * FROM users WHERE age >= 21 ORDER BY age DESC;
+UPDATE users SET age = age + 1 WHERE city = 'Delhi';
+SELECT name, age FROM users ORDER BY age LIMIT 3;
+DELETE FROM users WHERE id = 4;
+SELECT * FROM users;`,
+  index:
+`CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT);
+INSERT INTO products VALUES (1, 'pen', 10);
+INSERT INTO products VALUES (2, 'book', 250);
+INSERT INTO products VALUES (3, 'bag', 500);
+INSERT INTO products VALUES (4, 'bottle', 120);
+EXPLAIN SELECT * FROM products WHERE price = 500;
+CREATE INDEX idx_price ON products (price);
+EXPLAIN SELECT * FROM products WHERE price = 500;
+SELECT * FROM products WHERE price = 500;`,
+  txn:
+`BEGIN;
+INSERT INTO users VALUES (10, 'Temp', 40, 'Goa');
+SELECT * FROM users;
+ROLLBACK;
+SELECT * FROM users;`,
+  err:
+`INSERT INTO users VALUES (1, 'dup', 5, 'x');`
+};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function renderCard(r) {
+  let body;
+  if (r.table) {
+    const head = r.table.cols.map(c => `<th>${esc(c)}</th>`).join('');
+    const rows = r.table.rows.map(row =>
+      '<tr>' + row.map(v => `<td class="${/^-?\d+$/.test(v) ? 'num' : ''}">${esc(v)}</td>`).join('') + '</tr>'
+    ).join('');
+    body = `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>` +
+           `<div class="foot">${r.table.count} row${r.table.count === 1 ? '' : 's'}</div>`;
+  } else {
+    body = `<pre class="msg">${esc(r.text)}</pre>`;
+  }
+  return `<div class="card ${r.ok ? '' : 'err'}">` +
+    `<div class="q"><code>${esc(r.sql)}</code><span class="ms">${r.ms} ms</span></div>` +
+    `<div class="body">${body}</div></div>`;
+}
+
+async function loadSchema() {
+  try {
+    const d = await (await fetch('/api/schema')).json();
+    $('dot').className = 'dot' + (d.connected ? ' on' : '');
+    $('st').textContent = d.connected ? 'connected' : 'server band hai';
+    const box = $('tables');
+    if (!d.tables.length) { box.innerHTML = '<div class="empty">koi table nahi</div>'; return; }
+    box.innerHTML = d.tables.map(t =>
+      `<div class="tbl"><div class="name" data-t="${esc(t.name)}"><span>${esc(t.name)}</span><span>${t.columns.length} cols</span></div>` +
+      t.columns.map(c => `<div class="col"><span>${esc(c.name)}</span><span class="t">${esc(c.type)}</span>` +
+        (c.key ? `<span class="k">${esc(c.key)}</span>` : '') + '</div>').join('') + '</div>'
+    ).join('');
+    box.querySelectorAll('.name').forEach(el => el.onclick = () => {
+      $('sql').value = 'SELECT * FROM ' + el.dataset.t + ';';
+      run();
+    });
+  } catch (e) {
+    $('dot').className = 'dot';
+    $('st').textContent = 'bridge band hai';
+  }
+}
+
+async function run() {
+  const sql = $('sql').value;
+  if (!sql.trim()) return;
+  $('run').disabled = true;
+  try {
+    const d = await (await fetch('/api/run', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sql})
+    })).json();
+    if (d.error) throw new Error(d.error);
+    const out = $('out');
+    out.insertAdjacentHTML('afterbegin', d.results.map(renderCard).join(''));
+    out.scrollTop = 0;
+  } catch (e) {
+    $('out').insertAdjacentHTML('afterbegin',
+      `<div class="card err"><div class="body"><pre class="msg">${esc(e.message)}</pre></div></div>`);
+  }
+  $('run').disabled = false;
+  loadSchema();
+}
+
+$('run').onclick = run;
+$('clear').onclick = () => { $('out').innerHTML = ''; };
+$('sql').addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); run(); }
+});
+document.querySelectorAll('[data-ex]').forEach(b => b.onclick = () => {
+  $('sql').value = EXAMPLES[b.dataset.ex];
+  $('sql').focus();
+});
+$('sql').value = EXAMPLES.basic;
+loadSchema();
+</script>
+</body>
+</html>
