@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DB_HOST = "127.0.0.1"
 DB_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 7878
-WEB_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
+WEB_PORT = int(os.environ.get("PORT") or (sys.argv[2] if len(sys.argv) > 2 else 8000))
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 lock = threading.Lock()  # ek hi db session hai, toh ek time pe ek query
@@ -211,8 +211,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    srv = ThreadingHTTPServer(("127.0.0.1", WEB_PORT), Handler)
-    print("playground: http://127.0.0.1:%d   (mkdb_server port %d)" % (WEB_PORT, DB_PORT))
+    srv = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+    print("playground: http://0.0.0.0:%d   (mkdb_server port %d)" % (WEB_PORT, DB_PORT), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

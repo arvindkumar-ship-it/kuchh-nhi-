@@ -157,6 +157,31 @@ std::string Database::execute(const std::string& sql) {
         if (pager_.rollback()) reload_state();
         return "rollback ho gaya";
     }
+    if (up == "SHOW TABLES") {  // sirf padhta hai, isliye try ke bahar (error pe rollback nahi)
+        std::string out = "table";
+        for (const Table& t : tables_) out += "\n" + t.schema.name;
+        return out + "\n(" + std::to_string(tables_.size()) + " rows)";
+    }
+    if (up.rfind("DESCRIBE ", 0) == 0) {
+        std::string name = up.substr(9);
+        size_t nb = name.find_first_not_of(' ');
+        size_t ne = name.find_last_not_of(' ');
+        name = nb == std::string::npos ? "" : name.substr(nb, ne - nb + 1);
+        Table* t = nullptr;
+        for (Table& x : tables_) {
+            std::string u = x.schema.name;
+            for (char& ch : u) ch = (char)std::toupper((unsigned char)ch);
+            if (u == name) { t = &x; break; }
+        }
+        if (!t) throw std::runtime_error("table nahi mili: " + name);
+        std::string out = "column | type | key";
+        for (size_t i = 0; i < t->schema.columns.size(); i++) {
+            const ColumnDef& c = t->schema.columns[i];
+            out += "\n" + c.name + " | " + (c.type == ColType::Int ? "INT" : "TEXT") + " | " +
+                   ((int)i == t->schema.pk ? "PRI" : "");
+        }
+        return out + "\n(" + std::to_string(t->schema.columns.size()) + " rows)";
+    }
     try {
         return dispatch(sql);
     } catch (const std::exception& e) {
