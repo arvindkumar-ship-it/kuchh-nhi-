@@ -222,6 +222,24 @@ void BTree::free_value(const char* p, size_t len) {
     }
 }
 
+void BTree::destroy_rec(PageId pid) {
+    char buf[PAGE_SIZE];
+    pager_.read_page(pid, buf);
+    BTreeNode n(buf);
+    if (n.is_leaf()) {
+        for (uint16_t i = 0; i < n.count(); i++) {
+            uint16_t len;
+            const char* v = n.leaf_value(i, &len);
+            free_value(v, len);
+        }
+    } else {
+        for (uint16_t i = 0; i <= n.count(); i++) destroy_rec(n.child_at(i));
+    }
+    pager_.free_page(pid);
+}
+
+void BTree::destroy() { destroy_rec(root_); }
+
 static uint16_t node_capacity() {
     char b[PAGE_SIZE];
     BTreeNode n(b);

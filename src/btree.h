@@ -51,6 +51,9 @@ public:
 
     PageId root() const { return root_; }
 
+    // poori tree (root, internal, leaf, overflow pages) freelist me wapas. iske baad ye tree use mat karo
+    void destroy();
+
 private:
     // child split hua toh ye parent ko batata hai
     struct Split {
@@ -69,6 +72,7 @@ private:
 
     bool remove_rec(PageId pid, int64_t key);
     void rebalance_child(PageId pid, char* pbuf, uint16_t idx);  // underfull child ko sibling se merge
+    void destroy_rec(PageId pid);
     void free_value(const char* p, size_t len);                  // overflow chain wapas freelist me
 
     InsertResult insert_rec(PageId pid, int64_t key, const std::string& val, Split* split);

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 
 namespace mkdb {
@@ -207,6 +208,7 @@ std::string Database::dispatch(const std::string& sql) {
         if (s.kind != StmtKind::Select) throw std::runtime_error("EXPLAIN sirf SELECT pe chalta hai");
         return do_explain(s);
     }
+    if (norm(sql).rfind("DROP ", 0) == 0) return do_drop(sql);
     Stmt s = parse(sql);
     prepare(s);
     switch (s.kind) {
@@ -219,6 +221,50 @@ std::string Database::dispatch(const std::string& sql) {
         default: break;
     }
     throw std::runtime_error("statement samajh nahi aaya");
+}
+
+// DROP TABLE [IF EXISTS] naam
+std::string Database::do_drop(const std::string& sql) {
+    std::string t = norm(sql);
+    std::string orig = sql.substr(sql.find_first_not_of(" \t\r\n"), t.size());  // norm jitni hi lambai, asli case me
+    std::istringstream in(orig);
+    std::string w1, w2, w3, w4, extra;
+    in >> w1 >> w2 >> w3;
+    auto up = [](std::string x) { for (char& c : x) c = (char)std::toupper((unsigned char)c); return x; };
+    if (up(w1) != "DROP" || up(w2) != "TABLE" || w3.empty())
+        throw std::runtime_error("DROP TABLE [IF EXISTS] naam aise likho");
+    bool if_exists = false;
+    std::string name = w3;
+    if (up(w3) == "IF") {
+        in >> w4 >> name;
+        if (up(w4) != "EXISTS" || name.empty()) throw std::runtime_error("DROP TABLE IF EXISTS naam aise likho");
+        if_exists = true;
+    }
+    if (in >> extra) throw std::runtime_error("DROP TABLE me naam ke baad kuch nahi chahiye: " + extra);
+
+    Table* tb = find_table(name);
+    if (!tb) {
+        if (if_exists) return "table thi hi nahi: " + name;
+        throw std::runtime_error("table nahi mili: " + name);
+    }
+    int64_t tid = tb->id;
+    PageId troot = tb->root;
+
+    BTree cat(pager_, catalog_root_);
+    for (size_t i = 0; i < indexes_.size();) {  // pehle is table ke saare index
+        if (indexes_[i].table != name) { i++; continue; }
+        BTree(pager_, indexes_[i].root).destroy();
+        cat.remove(-indexes_[i].id);
+        indexes_.erase(indexes_.begin() + (long)i);
+    }
+    BTree(pager_, troot).destroy();
+    cat.remove(tid);
+    for (size_t i = 0; i < tables_.size(); i++) {
+        if (tables_[i].id == tid) { tables_.erase(tables_.begin() + (long)i); break; }
+    }
+    save_header();
+    pager_.flush();
+    return "table hata di: " + name;
 }
 
 void Database::prepare(Stmt& s) {

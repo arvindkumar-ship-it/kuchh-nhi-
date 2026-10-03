@@ -62,6 +62,7 @@ private:
     std::string do_create(const Stmt& s);
     std::string do_insert(const Stmt& s);
     std::string do_create_index(const Stmt& s);
+    std::string do_drop(const std::string& sql);
     void prepare(Stmt& s);  // analyzer + constant folding
     std::vector<IndexDef> defs_for(const std::string& table) const;
     void check_unique(const std::string& table, const std::vector<Value>& row);
