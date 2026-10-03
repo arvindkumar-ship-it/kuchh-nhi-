@@ -1,4 +1,5 @@
 #include "server_core.h"
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -15,6 +16,7 @@
   #include <arpa/inet.h>
   #include <netinet/in.h>
   #include <sys/socket.h>
+  #include <sys/time.h>
   #include <unistd.h>
   typedef int sock_t;
   #define CLOSESOCK close
@@ -44,7 +46,7 @@ struct Server::Impl {
     Database* db;
     Mutex mu;
     sock_t ls = BAD_SOCK;
-    volatile bool stopping = false;
+    std::atomic<bool> stopping{false};
     std::string host;
 };
 
@@ -53,6 +55,24 @@ struct Conn {
     Database* db;
     Mutex* mu;
 };
+
+// ek line (statement) ki max lambai
+static const size_t MAX_LINE = 1u << 20;  // 1 MiB
+// khuli transaction wale client ko itni der chup rehne do, phir kaat do
+static const int TXN_IDLE_MS = 60000;
+
+// recv ka timeout. ms = 0 matlab bina timeout
+static void set_recv_timeout(sock_t s, int ms) {
+#ifdef _WIN32
+    DWORD t = (DWORD)ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t));
+#else
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
 
 static bool send_all(sock_t s, const std::string& d) {
     size_t off = 0;
@@ -70,8 +90,10 @@ static void handle(sock_t cs, Database* db, Mutex* mu) {
     char tmp[4096];
     bool alive = true;
     while (alive) {
+        // lock tabhi pakda hota hai jab txn khuli ho, tab idle client ko time-limit
+        set_recv_timeout(cs, held ? TXN_IDLE_MS : 0);
         int n = (int)recv(cs, tmp, sizeof(tmp), 0);
-        if (n <= 0) break;
+        if (n <= 0) break;  // band hua, error, ya txn me bahut der chup raha
         buf.append(tmp, (size_t)n);
         size_t nl;
         while ((nl = buf.find('\n')) != std::string::npos) {
@@ -93,6 +115,12 @@ static void handle(sock_t cs, Database* db, Mutex* mu) {
             }
             if (!db->in_transaction()) { mu->unlock(); held = false; }  // txn khuli hai toh lock rakho
             if (!send_all(cs, reply)) { alive = false; break; }
+        }
+
+        // newline aaya hi nahi aur buffer bahut bada ho gaya
+        if (alive && buf.size() > MAX_LINE) {
+            send_all(cs, "-ERR line bahut lambi hai\r\n");
+            alive = false;
         }
     }
     if (!held) { mu->lock(); held = true; }

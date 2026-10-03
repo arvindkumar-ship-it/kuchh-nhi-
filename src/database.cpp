@@ -159,9 +159,17 @@ std::string Database::execute(const std::string& sql) {
     }
     try {
         return dispatch(sql);
+    } catch (const std::exception& e) {
+        // statement beech me fail hua toh adhura kaam undo. transaction ke andar
+        // bhi: aadhi badli hui state commit na ho, isliye poori transaction rollback
+        bool was_txn = pager_.in_txn();
+        if (pager_.rollback()) reload_state();
+        if (was_txn) {
+            throw std::runtime_error(std::string(e.what()) + " (transaction rollback ho gayi)");
+        }
+        throw;
     } catch (...) {
-        // transaction ke bahar statement beech me fail hua toh adhura kaam undo
-        if (!pager_.in_txn() && pager_.rollback()) reload_state();
+        if (pager_.rollback()) reload_state();
         throw;
     }
 }
