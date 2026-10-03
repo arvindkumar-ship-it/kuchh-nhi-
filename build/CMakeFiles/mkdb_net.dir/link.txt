@@ -1,2 +1,0 @@
-C:\MinGW\bin\ar.exe qc libmkdb_net.a CMakeFiles/mkdb_net.dir/src/server_core.cpp.obj
-C:\MinGW\bin\ranlib.exe libmkdb_net.a

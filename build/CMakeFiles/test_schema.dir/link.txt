@@ -1,3 +1,0 @@
-"C:\Program Files\CMake\bin\cmake.exe" -E rm -f CMakeFiles\test_schema.dir/objects.a
-C:\MinGW\bin\ar.exe qc CMakeFiles\test_schema.dir/objects.a @CMakeFiles\test_schema.dir\objects1.rsp
-C:\MinGW\bin\c++.exe -Wl,--whole-archive CMakeFiles\test_schema.dir/objects.a -Wl,--no-whole-archive -o test_schema.exe -Wl,--out-implib,libtest_schema.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\test_schema.dir\linkLibs.rsp

@@ -1,3 +1,0 @@
-"C:\Program Files\CMake\bin\cmake.exe" -E rm -f CMakeFiles\test_index.dir/objects.a
-C:\MinGW\bin\ar.exe qc CMakeFiles\test_index.dir/objects.a @CMakeFiles\test_index.dir\objects1.rsp
-C:\MinGW\bin\c++.exe -Wl,--whole-archive CMakeFiles\test_index.dir/objects.a -Wl,--no-whole-archive -o test_index.exe -Wl,--out-implib,libtest_index.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\test_index.dir\linkLibs.rsp

@@ -1,0 +1,5 @@
+build/
+*.db
+*.db-journal
+*.exe
+mkdb_sort_*.run

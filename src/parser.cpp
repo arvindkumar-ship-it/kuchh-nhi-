@@ -1,323 +1,366 @@
-#include "pager.h"
-#include <cstring>
+#include "parser.h"
 #include <stdexcept>
-#ifdef _WIN32
-  #include <io.h>
-  #include <windows.h>
-  #define SEEK64(f, off, wh) _fseeki64(f, (long long)(off), wh)
-  #define TELL64(f) _ftelli64(f)
-  #define FSYNC(f) _commit(_fileno(f))
-#else
-  #include <sys/types.h>
-  #include <unistd.h>
-  #define SEEK64(f, off, wh) fseeko(f, (off_t)(off), wh)
-  #define TELL64(f) ftello(f)
-  #define FSYNC(f) fsync(fileno(f))
-#endif
+#include <utility>
 
 namespace mkdb {
 
-static const uint32_t JMAGIC = 0x314A4B4D;  // "MKJ1"
-static const size_t FREE_HEAD_OFF = 16;      // page 0 me freelist head
+namespace {
 
-static bool file_exists(const std::string& p) {
-    FILE* f = fopen(p.c_str(), "rb");
-    if (!f) return false;
-    fclose(f);
-    return true;
-}
-static void remove_file(const std::string& p) { std::remove(p.c_str()); }
+class Parser {
+public:
+    explicit Parser(std::vector<Token> t) : toks_(std::move(t)) {}
 
-// file ko size tak chhota karo (file band honi chahiye)
-static void truncate_file(const std::string& p, uint64_t size) {
-#ifdef _WIN32
-    HANDLE h = CreateFileA(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("truncate: file khuli nahi");
-    LARGE_INTEGER li;
-    li.QuadPart = (LONGLONG)size;
-    bool ok = SetFilePointerEx(h, li, nullptr, FILE_BEGIN) && SetEndOfFile(h);
-    CloseHandle(h);
-    if (!ok) throw std::runtime_error("truncate fail");
-#else
-    if (truncate(p.c_str(), (off_t)size) != 0) throw std::runtime_error("truncate fail");
-#endif
-}
-
-Pager::Pager(const std::string& path, size_t cache_pages)
-    : path_(path), jpath_(path + "-journal"), frames_(cache_pages ? cache_pages : 1) {
-    open_file();
-
-    // pichhli baar crash hua tha toh adhura journal pada hoga: pehle undo
-    if (file_exists(jpath_)) restore_from_journal();
-
-    SEEK64(file_, 0, SEEK_END);
-    long long size = TELL64(file_);
-    if (size < 0 || size % PAGE_SIZE != 0) {
-        throw std::runtime_error("file ka size 4096 ka multiple nahi, file kharab hai");
-    }
-    num_pages_ = (uint32_t)(size / PAGE_SIZE);
-}
-
-Pager::~Pager() {
-    // explicit txn khuli hai toh journal chhod do (agli open pe rollback = crash jaisa)
-    try {
-        if (!in_txn_) commit();
-    } catch (...) {
-    }
-    close_file();
-    if (jfile_) fclose(jfile_);
-}
-
-void Pager::open_file() {
-    file_ = fopen(path_.c_str(), "r+b");
-    if (!file_) {
-        FILE* c = fopen(path_.c_str(), "wb");
-        if (c) fclose(c);
-        file_ = fopen(path_.c_str(), "r+b");
-    }
-    if (!file_) throw std::runtime_error("file khul nahi payi: " + path_);
-}
-
-void Pager::close_file() {
-    if (file_) {
-        fclose(file_);
-        file_ = nullptr;
-    }
-}
-
-void Pager::raw_read(PageId id, char* out) {
-    if (SEEK64(file_, (uint64_t)id * PAGE_SIZE, SEEK_SET) != 0 || fread(out, 1, PAGE_SIZE, file_) != PAGE_SIZE)
-        throw std::runtime_error("read fail ho gaya");
-}
-
-// db file me koi bhi page likhne se pehle journal disk pe pakka hona chahiye
-void Pager::raw_write(PageId id, const char* data) {
-    sync_journal();
-    if (SEEK64(file_, (uint64_t)id * PAGE_SIZE, SEEK_SET) != 0 || fwrite(data, 1, PAGE_SIZE, file_) != PAGE_SIZE)
-        throw std::runtime_error("write fail ho gaya");
-}
-
-void Pager::sync_journal() {
-    if (!journal_open_ || !journal_unsynced_) return;
-    if (fflush(jfile_) != 0 || FSYNC(jfile_) != 0) throw std::runtime_error("journal fsync fail");
-    journal_unsynced_ = false;
-}
-
-void Pager::sync_file() {
-    if (fflush(file_) != 0 || FSYNC(file_) != 0) throw std::runtime_error("db fsync fail");
-}
-
-// ---------- clock cache ----------
-
-size_t Pager::evict_slot() {
-    while (true) {
-        size_t cur = hand_;
-        hand_ = (hand_ + 1) % frames_.size();
-        Frame& f = frames_[cur];
-        if (!f.valid) return cur;
-        if (f.ref) {  // doosra mauka
-            f.ref = false;
-            continue;
+    Stmt statement() {
+        Stmt s;
+        switch (peek().type) {
+            case Tok::Create: next(); s.kind = StmtKind::Create; parse_create(s); break;
+            case Tok::Insert: next(); s.kind = StmtKind::Insert; parse_insert(s); break;
+            case Tok::Select: next(); s.kind = StmtKind::Select; parse_select(s); break;
+            case Tok::Delete: next(); s.kind = StmtKind::Delete; parse_delete(s); break;
+            case Tok::Update: next(); s.kind = StmtKind::Update; parse_update(s); break;
+            default:
+                fail("statement CREATE/INSERT/SELECT/DELETE/UPDATE se shuru karo");
         }
-        if (f.dirty) {
-            raw_write(f.id, f.data.data());
-            f.dirty = false;
+
+        accept(Tok::Semicolon);
+        if (peek().type != Tok::End) fail("query ke baad kuch extra hai");
+        return s;
+    }
+
+private:
+    std::vector<Token> toks_;
+    size_t pos_ = 0;
+
+    // ---------- token ka kaam ----------
+
+    const Token& peek() const { return toks_[pos_]; }
+
+    Token next() {
+        Token t = toks_[pos_];
+        if (pos_ + 1 < toks_.size()) pos_++;  // End token ke aage nahi jaate
+        return t;
+    }
+
+    bool accept(Tok t) {
+        if (peek().type == t) {
+            next();
+            return true;
         }
-        map_.erase(f.id);
-        f.valid = false;
-        return cur;
+        return false;
     }
-}
 
-size_t Pager::install(PageId id) {
-    size_t slot = evict_slot();
-    Frame& f = frames_[slot];
-    if (f.data.empty()) f.data.resize(PAGE_SIZE);
-    f.id = id;
-    f.valid = true;
-    f.ref = true;
-    f.dirty = false;
-    map_[id] = slot;
-    return slot;
-}
-
-void Pager::read_page(PageId id, char* out) {
-    if (id >= num_pages_) throw std::runtime_error("read: page exist nahi karti");
-    auto it = map_.find(id);
-    if (it != map_.end()) {
-        hits_++;
-        Frame& f = frames_[it->second];
-        f.ref = true;
-        std::copy(f.data.begin(), f.data.end(), out);
-        return;
+    [[noreturn]] void fail(const std::string& msg) {
+        const Token& t = peek();
+        std::string got = (t.type == Tok::End) ? "query khatam" : "'" + t.text + "'";
+        throw std::runtime_error("parser: " + msg + ", mila " + got +
+                                 " position " + std::to_string(t.pos));
     }
-    misses_++;
-    size_t slot = install(id);
-    Frame& f = frames_[slot];
-    raw_read(id, f.data.data());
-    std::copy(f.data.begin(), f.data.end(), out);
-}
 
-void Pager::write_page(PageId id, const char* data) {
-    if (id >= num_pages_) throw std::runtime_error("write: pehle allocate_page karo");
-    journal_page(id);  // badalne se pehle purani copy journal me
-    auto it = map_.find(id);
-    size_t slot = (it != map_.end()) ? it->second : install(id);
-    Frame& f = frames_[slot];
-    std::copy(data, data + PAGE_SIZE, f.data.begin());
-    f.ref = true;
-    f.dirty = true;
-}
+    Token expect(Tok t, const char* what) {
+        if (peek().type != t) fail(std::string("chahiye ") + what);
+        return next();
+    }
 
-// ---------- freelist ----------
+    std::string ident(const char* what) {
+        return expect(Tok::Ident, what).text;
+    }
 
-PageId Pager::free_head() {
-    char b[PAGE_SIZE];
-    read_page(0, b);
-    PageId h;
-    std::memcpy(&h, b + FREE_HEAD_OFF, 4);
-    return h;  // 0 = khali (page 0 kabhi free nahi hota)
-}
-
-void Pager::set_free_head(PageId h) {
-    char b[PAGE_SIZE];
-    read_page(0, b);
-    std::memcpy(b + FREE_HEAD_OFF, &h, 4);
-    write_page(0, b);
-}
-
-void Pager::free_page(PageId id) {
-    if (!freelist_) return;
-    if (id == 0 || id >= num_pages_) throw std::runtime_error("free_page: galat page");
-    char b[PAGE_SIZE] = {0};
-    PageId head = free_head();
-    std::memcpy(b, &head, 4);  // purana head is page ke baad
-    write_page(id, b);
-    set_free_head(id);
-}
-
-PageId Pager::allocate_page() {
-    open_journal();  // orig_pages_ pehle note ho, phir count badhe
-    if (freelist_ && num_pages_ > 0) {
-        PageId h = free_head();
-        if (h != 0) {
-            char b[PAGE_SIZE];
-            read_page(h, b);
-            PageId next;
-            std::memcpy(&next, b, 4);
-            set_free_head(next);
-            char zeros[PAGE_SIZE] = {0};
-            write_page(h, zeros);
-            return h;
+    // number token ko int64 me. bahut bada ho toh error
+    int64_t to_int(const Token& t) {
+        try {
+            return std::stoll(t.text);
+        } catch (const std::out_of_range&) {
+            fail("number bahut bada hai");
         }
     }
-    PageId id = num_pages_++;
-    size_t slot = install(id);
-    Frame& f = frames_[slot];
-    std::fill(f.data.begin(), f.data.end(), 0);
-    f.dirty = true;
-    return id;
-}
 
-// ---------- journal / transaction ----------
+    // ---------- expression (Pratt) ----------
 
-void Pager::open_journal() {
-    if (journal_open_) return;
-    jfile_ = fopen(jpath_.c_str(), "wb");
-    if (!jfile_) throw std::runtime_error("journal ban nahi payi");
-    orig_pages_ = num_pages_;
-    uint32_t magic = JMAGIC;
-    if (fwrite(&magic, 1, 4, jfile_) != 4 || fwrite(&orig_pages_, 1, 4, jfile_) != 4)
-        throw std::runtime_error("journal header likh nahi paya");
-    journal_open_ = true;
-    journal_unsynced_ = true;
-    journaled_.clear();
-}
-
-void Pager::journal_page(PageId id) {
-    open_journal();
-    if (id >= orig_pages_ || journaled_.count(id)) return;
-    // is txn me ye page abhi tak badli nahi, toh disk wali copy hi original hai
-    std::vector<char> buf(PAGE_SIZE);
-    raw_read(id, buf.data());
-    if (fwrite(&id, 1, 4, jfile_) != 4 || fwrite(buf.data(), 1, PAGE_SIZE, jfile_) != PAGE_SIZE)
-        throw std::runtime_error("journal write fail");
-    journal_unsynced_ = true;  // fsync tab hoga jab db file me pehla page likhna ho
-    journaled_.insert(id);
-}
-
-void Pager::begin() {
-    if (in_txn_) throw std::runtime_error("transaction pehle se chal rahi hai");
-    commit();  // koi implicit kaam pending ho toh pehle final
-    in_txn_ = true;
-}
-
-void Pager::commit() {
-    for (Frame& f : frames_) {
-        if (f.valid && f.dirty) {
-            raw_write(f.id, f.data.data());
-            f.dirty = false;
+    static int infix_prec(Tok t) {
+        switch (t) {
+            case Tok::Or: return 1;
+            case Tok::And: return 2;
+            case Tok::Eq: case Tok::Neq: case Tok::Lt:
+            case Tok::Le: case Tok::Gt: case Tok::Ge: return 4;
+            case Tok::Plus: case Tok::Minus: return 5;
+            case Tok::Star: case Tok::Slash: return 6;
+            default: return 0;  // operator nahi
         }
     }
-    sync_file();  // db file disk pe pakki hone ke BAAD hi journal hatao
-    if (journal_open_) {
-        fclose(jfile_);
-        jfile_ = nullptr;
-        remove_file(jpath_);
-        journal_open_ = false;
-        journal_unsynced_ = false;
-        journaled_.clear();
+
+    ExprPtr expr(int rbp = 0) {
+        ExprPtr left = prefix();
+
+        while (infix_prec(peek().type) > rbp) {
+            int prec = infix_prec(peek().type);
+            Tok op = next().type;
+            ExprPtr right = expr(prec);
+
+            ExprPtr node(new Expr());
+            node->kind = ExprKind::Binary;
+            node->op = op;
+            node->lhs = std::move(left);
+            node->rhs = std::move(right);
+            left = std::move(node);
+        }
+        return left;
     }
-    in_txn_ = false;
-}
 
-void Pager::flush() {
-    if (in_txn_) return;
-    commit();
-}
+    // wo cheezein jo expression ki shuruat me aa sakti hain
+    ExprPtr prefix() {
+        Token t = peek();
+        ExprPtr e(new Expr());
 
-bool Pager::rollback() {
-    bool had = journal_open_;
-    in_txn_ = false;
-    if (!had) return false;
-    sync_journal();
-    fclose(jfile_);
-    jfile_ = nullptr;
-    journal_open_ = false;
-    journaled_.clear();
-    for (Frame& f : frames_) f.valid = f.dirty = f.ref = false;
-    map_.clear();
-    hand_ = 0;
-    restore_from_journal();
-    return true;
-}
-
-// journal ke pages db file pe wapas, file purane size pe, journal delete
-void Pager::restore_from_journal() {
-    FILE* j = fopen(jpath_.c_str(), "rb");
-    if (j) {
-        uint32_t magic = 0, orig = 0;
-        bool ok = fread(&magic, 1, 4, j) == 4 && fread(&orig, 1, 4, j) == 4 && magic == JMAGIC;
-        if (ok) {
-            std::vector<char> buf(PAGE_SIZE);
-            uint32_t id;
-            // adhuri aakhri entry (crash beech me) ignore: tab tak db me us page ko haath nahi laga tha
-            while (fread(&id, 1, 4, j) == 4 && fread(buf.data(), 1, PAGE_SIZE, j) == PAGE_SIZE) {
-                if (SEEK64(file_, (uint64_t)id * PAGE_SIZE, SEEK_SET) != 0 ||
-                    fwrite(buf.data(), 1, PAGE_SIZE, file_) != PAGE_SIZE)
-                    throw std::runtime_error("recovery: write fail");
+        switch (t.type) {
+            case Tok::Number:
+                e->kind = ExprKind::Number;
+                e->num = to_int(t);   // error ho toh yahi token dikhega
+                next();
+                return e;
+            case Tok::String:
+                next();
+                e->kind = ExprKind::String;
+                e->text = t.text;
+                return e;
+            case Tok::Ident:
+                next();
+                e->kind = ExprKind::Column;
+                e->text = t.text;
+                return e;
+            case Tok::LParen: {
+                next();
+                ExprPtr inner = expr(0);
+                expect(Tok::RParen, "')'");
+                return inner;
             }
-            sync_file();
-            close_file();
-            truncate_file(path_, (uint64_t)orig * PAGE_SIZE);
-            open_file();
-            sync_file();
-            num_pages_ = orig;
+            case Tok::Minus:
+            case Tok::Not:
+                next();
+                e->kind = ExprKind::Unary;
+                e->op = t.type;
+                e->lhs = expr(t.type == Tok::Not ? 3 : 7);
+                return e;
+            default:
+                fail("expression chahiye");
         }
-        fclose(j);
     }
-    remove_file(jpath_);
+
+    // ---------- statements ----------
+
+    void parse_where(Stmt& s) {
+        if (accept(Tok::Where)) s.where = expr();
+    }
+
+    void parse_create(Stmt& s) {
+        bool uniq = accept(Tok::Unique);
+        if (accept(Tok::Index)) {
+            s.kind = StmtKind::CreateIndex;
+            s.index_unique = uniq;
+            s.index_name = ident("index ka naam");
+            expect(Tok::On, "ON");
+            s.table = ident("table ka naam");
+            expect(Tok::LParen, "'('");
+            s.index_col = ident("column ka naam");
+            expect(Tok::RParen, "')'");
+            return;
+        }
+        if (uniq) fail("UNIQUE ke baad INDEX chahiye");
+        expect(Tok::Table, "TABLE");
+        s.table = ident("table ka naam");
+        expect(Tok::LParen, "'('");
+        do {
+            ColumnDef c;
+            c.name = ident("column ka naam");
+            if (accept(Tok::Int)) c.type = ColType::Int;
+            else if (accept(Tok::Text)) c.type = ColType::Text;
+            else fail("column ka type (INT ya TEXT) chahiye");
+
+            if (accept(Tok::Primary)) {
+                expect(Tok::Key, "KEY");
+                c.primary = true;
+            }
+            s.columns.push_back(c);
+        } while (accept(Tok::Comma));
+        expect(Tok::RParen, "')'");
+    }
+
+    void parse_insert(Stmt& s) {
+        expect(Tok::Into, "INTO");
+        s.table = ident("table ka naam");
+
+        if (accept(Tok::LParen)) {
+            do {
+                s.insert_cols.push_back(ident("column ka naam"));
+            } while (accept(Tok::Comma));
+            expect(Tok::RParen, "')'");
+        }
+
+        expect(Tok::Values, "VALUES");
+        expect(Tok::LParen, "'('");
+        do {
+            s.values.push_back(expr());
+        } while (accept(Tok::Comma));
+        expect(Tok::RParen, "')'");
+    }
+
+    void parse_select(Stmt& s) {
+        if (accept(Tok::Star)) {
+            s.select_all = true;
+        } else {
+            do {
+                s.select_cols.push_back(ident("column ka naam"));
+            } while (accept(Tok::Comma));
+        }
+
+        expect(Tok::From, "FROM");
+        s.table = ident("table ka naam");
+        parse_where(s);
+
+        if (accept(Tok::Order)) {
+            expect(Tok::By, "BY");
+            s.order_col = ident("column ka naam");
+            if (accept(Tok::Desc)) s.order_desc = true;
+            else accept(Tok::Asc);
+        }
+
+        if (accept(Tok::Limit)) {
+            Token n = expect(Tok::Number, "LIMIT ke baad number");
+            s.has_limit = true;
+            s.limit = to_int(n);
+        }
+    }
+
+    void parse_delete(Stmt& s) {
+        expect(Tok::From, "FROM");
+        s.table = ident("table ka naam");
+        parse_where(s);
+    }
+
+    void parse_update(Stmt& s) {
+        s.table = ident("table ka naam");
+        expect(Tok::Set, "SET");
+        do {
+            Assignment a;
+            a.col = ident("column ka naam");
+            expect(Tok::Eq, "'='");
+            a.value = expr();
+            s.assigns.push_back(std::move(a));
+        } while (accept(Tok::Comma));
+        parse_where(s);
+    }
+};
+
+// ---------- text me dikhane ke helpers ----------
+
+const char* op_str(Tok t) {
+    switch (t) {
+        case Tok::Or: return "OR";
+        case Tok::And: return "AND";
+        case Tok::Eq: return "=";
+        case Tok::Neq: return "!=";
+        case Tok::Lt: return "<";
+        case Tok::Le: return "<=";
+        case Tok::Gt: return ">";
+        case Tok::Ge: return ">=";
+        case Tok::Plus: return "+";
+        case Tok::Minus: return "-";
+        case Tok::Star: return "*";
+        case Tok::Slash: return "/";
+        default: return "?";
+    }
+}
+
+std::string join(const std::vector<std::string>& v, const char* sep) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i > 0) out += sep;
+        out += v[i];
+    }
+    return out;
+}
+
+}  // namespace
+
+Stmt parse(const std::string& sql) {
+    Parser p(tokenize(sql));
+    return p.statement();
+}
+
+std::string expr_to_string(const Expr& e) {
+    switch (e.kind) {
+        case ExprKind::Number:
+            return std::to_string(e.num);
+        case ExprKind::String: {
+            std::string out = "'";
+            for (char c : e.text) {
+                if (c == '\'') out += "''";
+                else out += c;
+            }
+            return out + "'";
+        }
+        case ExprKind::Column:
+            return e.text;
+        case ExprKind::Unary:
+            return std::string("(") + (e.op == Tok::Not ? "NOT " : "-") +
+                   expr_to_string(*e.lhs) + ")";
+        case ExprKind::Binary:
+            return "(" + expr_to_string(*e.lhs) + " " + op_str(e.op) + " " +
+                   expr_to_string(*e.rhs) + ")";
+    }
+    return "?";
+}
+
+std::string stmt_to_string(const Stmt& s) {
+    std::string out;
+    switch (s.kind) {
+        case StmtKind::Create: {
+            std::vector<std::string> cols;
+            for (const ColumnDef& c : s.columns) {
+                std::string d = c.name + (c.type == ColType::Int ? " INT" : " TEXT");
+                if (c.primary) d += " PRIMARY KEY";
+                cols.push_back(d);
+            }
+            out = "CREATE TABLE " + s.table + " (" + join(cols, ", ") + ")";
+            break;
+        }
+        case StmtKind::CreateIndex:
+            out = std::string("CREATE ") + (s.index_unique ? "UNIQUE " : "") + "INDEX " + s.index_name +
+                  " ON " + s.table + " (" + s.index_col + ")";
+            break;
+        case StmtKind::Insert: {
+            out = "INSERT " + s.table;
+            if (!s.insert_cols.empty()) out += " (" + join(s.insert_cols, ", ") + ")";
+            std::vector<std::string> vals;
+            for (const ExprPtr& e : s.values) vals.push_back(expr_to_string(*e));
+            out += " VALUES [" + join(vals, ", ") + "]";
+            break;
+        }
+        case StmtKind::Select: {
+            out = "SELECT " + (s.select_all ? std::string("*") : join(s.select_cols, ", ")) +
+                  " FROM " + s.table;
+            if (s.where) out += " WHERE " + expr_to_string(*s.where);
+            if (!s.order_col.empty()) {
+                out += " ORDER BY " + s.order_col + (s.order_desc ? " DESC" : " ASC");
+            }
+            if (s.has_limit) out += " LIMIT " + std::to_string(s.limit);
+            break;
+        }
+        case StmtKind::Delete: {
+            out = "DELETE FROM " + s.table;
+            if (s.where) out += " WHERE " + expr_to_string(*s.where);
+            break;
+        }
+        case StmtKind::Update: {
+            std::vector<std::string> sets;
+            for (const Assignment& a : s.assigns) {
+                sets.push_back(a.col + " = " + expr_to_string(*a.value));
+            }
+            out = "UPDATE " + s.table + " SET " + join(sets, ", ");
+            if (s.where) out += " WHERE " + expr_to_string(*s.where);
+            break;
+        }
+    }
+    return out;
 }
 
 }  // namespace mkdb
