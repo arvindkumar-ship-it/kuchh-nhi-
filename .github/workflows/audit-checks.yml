@@ -1,0 +1,15 @@
+name: Audit repair checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  native-engine:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build
+      - run: cmake --build build --config Release
+      - run: ctest --test-dir build -C Release --output-on-failure
